@@ -1,167 +1,335 @@
 # -*- coding: utf-8 -*-
 
+import sys, os
+sys.path.insert(1, os.path.join(sys.path[0], '..'))
+
 import re
-import sys
-sys.path.insert(0,'..')
-import time
 import config
-import telebot # https://github.com/eternnoir/pyTelegramBotAPI
-import idoit_bot.SQLighter as db
-from threading import Thread
-from datetime import datetime, time as time2, timedelta
-from idoit_bot.SQLighter import SQLighter
+import telebot  # https://github.com/eternnoir/pyTelegramBotAPI
+import db_handler as db
+from telebot import types
+from datetime import datetime, timedelta
+from telebot.apihelper import ApiException
 
 
 bot = telebot.TeleBot(config.token_idoitbot)
 
+MAIN_MENU = types.ReplyKeyboardMarkup(resize_keyboard=True)
+MAIN_MENU.row('Показать все задачи')
+MAIN_MENU.row('Задачи')
+MAIN_MENU.row('Напоминания')
+MAIN_MENU.row('Часовой пояс', 'Помощь')
 
-@bot.message_handler(commands=['help', 'start'])
-def helper(message):
-    bot.send_message(message.chat.id, "Как работать с I Do It Bot:\n1. Установите часовой пояс своего региона командой: /timezone\n2. Добавьте текущие задачи командой: /addtask\n3. Установите напоминания о своих задачах: /setreminder\n\nСписок всех команд можно посмотреть, нажав на значок [ / ] внизу экрана.\n\nБота можно использовать для хранения заметок, поскольку он не отвечает на обычные сообщения, а только на команды.")
-    db.add_user(message.from_user)
-    
-    
-@bot.message_handler(commands=['timezone'])
+
+@bot.message_handler(commands=['start'])
+def start(message):
+    if db.new_user(message.chat):
+        send_message(message.chat.id,
+                     "Бот *I Do It* помогает Вам помнить о всех важных задачах и делах, а также "
+                     "напоминает о них, когда это необходимо.\n", parse_mode='Markdown')
+        set_tz(message)
+    else:
+        main_menu(message)
+
+
+@bot.message_handler(func=lambda message: message.text == 'Главное меню' and message.content_type == 'text')
+def main_menu(message):
+    state = db.get_state(message.chat)
+    if state != 'timezone':
+        db.set_state(message.chat, 'init')
+        send_message(message.chat.id, "*Главное меню*",
+                     reply_markup=MAIN_MENU, parse_mode='Markdown')
+    else:
+        set_tz(message)
+
+
+@bot.message_handler(func=lambda message: message.text == 'Помощь' and message.content_type == 'text')
+def help(message):
+    state = db.get_state(message.chat)
+    if state == 'init':
+        send_message(message.chat.id,
+                     "*Как работать с I Do It Bot*\n\n"
+                     "Откройте клавиатуру бота и выберите _одну из команд_:\n"
+                     "1. *Показать все задачи* - отправляет Ваши существующие на данный момент задачи.\n"
+                     "2. *Задачи* - открывает меню задач, где их можно добавлять, изменять, удалять и т.д.\n"
+                     "3. *Напоминания* - открывает меню напоминаний, где их можно добавлять, удалять и т.д.\n"
+                     "4. *Часовой пояс* - настройка часового пояса (для корректной работы напоминаний).\n"
+                     "5. *Помощь* - меню, в котором Вы находитесь прямо сейчас.\n",
+                     reply_markup=MAIN_MENU, parse_mode='Markdown')
+    else:
+        send_message(message.chat.id, "Для вызова инструкции вернитесь в главное меню.")
+
+
+@bot.message_handler(func=lambda message: message.text == 'Завершить' and message.content_type == 'text')
+def done(message):
+    state = db.get_state(message.chat)
+    if state == 'timezone':
+        db.set_state(message.chat, 'init')
+        main_menu(message)
+    elif state == 'add_task' or state == 'del_task' or state == 'clear_tasks':
+        db.set_state(message.chat, 'tasks')
+        tasks(message)
+    elif state == 'add_rem' or state == 'del_rem' or state == 'clear_rems':
+        db.set_state(message.chat, 'reminders')
+        reminders(message)
+
+
+@bot.message_handler(func=lambda message: message.text == 'Часовой пояс' and message.content_type == 'text')
+def set_tz(message):
+    state = db.get_state(message.chat)
+    if state == 'init' or state == 'timezone':
+        db.set_state(message.chat, 'timezone') if state == 'init' else None
+        markup = types.ReplyKeyboardHide()
+        send_message(message.chat.id,
+                     "Для правильной работы напоминаний, укажите Ваш часовой пояс в формате UTC: "
+                     "*[-12; +14]*\n\nПример: +3\n_(Московское время)_",
+                     reply_markup=markup, parse_mode='Markdown')
+    else:
+        send_message(message.chat.id, "Для настройки часового пояса вернитесь в главное меню.")
+
+
+@bot.message_handler(regexp=r'^[+-]?[0-1]?[0-9]\s?$')
 def timezone(message):
-    text = message.text[9:].strip()
-    utc = 0
-    try:
-        utc = int(text)
-        date = datetime.now() + timedelta(hours=utc)
-        bot.send_message(message.chat.id, "Часовой пояс установлен.\nВаше время сейчас: %02d%s%02d\n" % (date.hour, ':', date.minute))
-        db.update_utc(message.from_user, utc)
-    except ValueError:
-        bot.send_message(message.chat.id, "Часовой пояс введён некорректно.\nВведите в формате: '/timezone +3' (это московское время)")
+    state = db.get_state(message.chat)
+    if state == 'timezone':
+        tz = int(re.search(r'^[+-]?[0-1]?[0-9]\s?$', message.text).group())
+        if -12 <= tz <= 14:
+            markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+            markup.row('Завершить')
+            date = datetime.utcnow() + timedelta(hours=tz)
+            send_message(message.chat.id,
+                         "Часовой пояс установлен.\nВаше время сейчас: *%02d%s%02d*\n\n"
+                         "Если время указано верно, нажмите '*Завершить*'.\n"
+                         "Если нет - введите ещё раз." % (date.hour, ':', date.minute),
+                         reply_markup=markup, parse_mode='Markdown')
+            db.set_timezone(message.chat, tz)
+        else:
+            send_message(message.chat.id,
+                         "Часовой пояс указан в неверном формате, попробуйте ещё раз.\n"
+                         "UTC: *[-12; +14]*", parse_mode='Markdown')
+    elif state == 'add_task':
+        add_task(message)
 
 
-@bot.message_handler(commands=['reminders'])
-def reminders(message):
-    text = db.show_reminders(message.from_user)
-    if text is None:
-        bot.send_message(message.chat.id, "У вас нет напоминалок.")
-    else:
-        bot.send_message(message.chat.id, text)
-    
-
-@bot.message_handler(commands=['setreminder'])
-def setreminder(message):
-    text = message.text[12:].strip()
-    timer = re.split('[:-]', text)
-    time = None
-    if len(timer) == 2:
-        try:
-            hour = int(timer[0])
-            minute = int(timer[1])
-            if (hour > 23 and hour < 0) or (minute > 59 and minute < 0):
-                raise ValueError
-            time = time2(hour=hour, minute=minute)
-            bot.send_message(message.chat.id, "Время напоминания установлено.\nНапоминание будет в %02d%s%02d\n" % (hour, ':', minute))
-            db.set_reminder(message.from_user, time)
-        except ValueError:
-            bot.send_message(message.chat.id, "Время указано некорректно.\nВведите в формате: '/setreminder 10:30'")
-    else:
-        bot.send_message(message.chat.id, "Время указано некорректно.\nВведите в формате: '/setreminder 10:30'")
-    
-    
-@bot.message_handler(commands=['delreminder'])
-def delreminder(message):
-    text = message.text[12:].strip()
-    timer = re.split('[:-]', text)
-    time = None
-    if len(timer) == 2:
-        try:
-            hour = int(timer[0])
-            minute = int(timer[1])
-            if (hour > 23 and hour < 0) or (minute > 59 and minute < 0):
-                raise ValueError
-            time = time2(hour=hour, minute=minute)
-            bot.send_message(message.chat.id, "Напоминание удалено.")
-            db.del_reminder(message.from_user, time)
-        except ValueError:
-            bot.send_message(message.chat.id, "Время указано некорректно.\nВведите в формате: '/delreminder 10:30'")
-    else:
-        bot.send_message(message.chat.id, "Время указано некорректно.\nВведите в формате: '/delreminder 10:30'")
-    
-    
-@bot.message_handler(commands=['clearrems'])
-def clearrems(message):
-    text = message.text[10:].strip().lower()
-    if text == "yes":
-        db.clear_rems(message.from_user)
-        bot.send_message(message.chat.id, "Ваши напоминания удалены.")
-    else:
-        bot.send_message(message.chat.id, "Напишите слово 'yes' после команды /clearrems, чтобы избежать случайного удаления задач.")
-
-
-@bot.message_handler(commands=['tasks'])
+@bot.message_handler(func=lambda message: message.text == 'Задачи' and message.content_type == 'text')
 def tasks(message):
-    text = db.show_tasks(message.from_user)
-    if text is None:
-        bot.send_message(message.chat.id, "У вас нет задач.")
-    else:
-        bot.send_message(message.chat.id, text)
-    
+    state = db.get_state(message.chat)
+    if state == 'init' or state == 'tasks':
+        db.set_state(message.chat, 'tasks') if state == 'init' else None
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        markup.row('Показать все задачи')
+        markup.row('Добавить')
+        markup.row('Удалить', 'Удалить все')
+        markup.row('Главное меню')
+        send_message(message.chat.id, "*Меню задач*", reply_markup=markup, parse_mode='Markdown')
 
-@bot.message_handler(commands=['addtask'])
-def addtask(message):
-    text = message.text[8:].strip()
-    if len(text) > 1 and len(text) < 100:
-        bot.send_message(message.chat.id, "Задача \"" + text + "\" добавлена.")
-        db.add_task(message.from_user, text)
-    else:
-        bot.send_message(message.chat.id, "Пишите через пробел после команды /addtask.\n1 символ < текст задачи < 100 символов.")
-    
-    
-@bot.message_handler(commands=['removetask'])
-def removetask(message):
-    text = message.text[11:].strip()
-    if len(text) > 0 and len(text) < 20:
+
+@bot.message_handler(func=lambda message: message.text == 'Напоминания' and message.content_type == 'text')
+def reminders(message):
+    state = db.get_state(message.chat)
+    if state == 'init' or state == 'reminders':
+        db.set_state(message.chat, 'reminders') if state == 'init' else None
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        markup.row('Показать все напоминания')
+        markup.row('Добавить')
+        markup.row('Удалить', 'Удалить все')
+        markup.row('Главное меню')
+        send_message(message.chat.id, "*Меню напоминаний*", reply_markup=markup, parse_mode='Markdown')
+
+
+@bot.message_handler(func=lambda message: message.text == 'Показать все задачи' and message.content_type == 'text')
+def show_tasks(message):
+    state = db.get_state(message.chat)
+    if state == 'init' or state == 'tasks':
+        text = db.show_tasks(message.from_user)
+        send_message(message.chat.id, text, parse_mode='Markdown')
+
+
+@bot.message_handler(func=lambda message: message.text == 'Показать все напоминания' and message.content_type == 'text')
+def show_rems(message):
+    state = db.get_state(message.chat)
+    if state == 'reminders':
+        text = db.show_rems(message.from_user)
+        send_message(message.chat.id, text, parse_mode='Markdown')
+
+
+@bot.message_handler(func=lambda message: message.text == 'Добавить' and message.content_type == 'text')
+def add(message):
+    state = db.get_state(message.chat)
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row('Завершить')
+    if state == 'tasks' or state == 'add_task':
+        db.set_state(message.chat, 'add_task') if state == 'tasks' else None
+        send_message(message.chat.id,
+                     "Напишите свои задачи.\n"
+                     "Формат: _одна задача = одна строка_\n\n"
+                     "Задачи можно добавлять отдельными сообщениями, либо в одном сообщении "
+                     "несколько задач, каждую начиная с новой строки.",
+                     reply_markup=markup, parse_mode='Markdown')
+    elif state == 'reminders' or state == 'add_rem':
+        db.set_state(message.chat, 'add_rem') if state == 'reminders' else None
+        send_message(message.chat.id,
+                     "Установите напоминания.\n"
+                     "Формат: _13:45_ или _13-45_\n\n"
+                     "Напоминания можно добавлять отдельными сообщениями, либо в одном сообщении "
+                     "несколько задач, каждая при этом начинается с новой строки.",
+                     reply_markup=markup, parse_mode='Markdown')
+
+
+@bot.message_handler(func=lambda message: message.text == 'Удалить' and message.content_type == 'text')
+def delete(message):
+    state = db.get_state(message.chat)
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    if state == 'tasks' or state == 'del_task':
+        tasks = db.all_tasks(message.chat)
+        if tasks:
+            db.set_state(message.chat, 'del_task') if state == 'tasks' else None
+            for task in tasks:
+                markup.row(task[:30])
+            markup.row('Завершить')
+            send_message(message.chat.id,
+                         "Выберите задачу для удаления, нажав на неё на клавиатуре.\n\n"
+                         "Чтобы окончить процесс удаления, нажмите кнопку '*Завершить*'.",
+                         reply_markup=markup, parse_mode='Markdown')
+        else:
+            done(message)
+    elif state == 'reminders' or state == 'del_rem':
+        rems = db.all_rems(message.chat)
+        if rems:
+            db.set_state(message.chat, 'del_rem') if state == 'reminders' else None
+            for rem in rems:
+                markup.row('• ' + rem)
+            markup.row('Завершить')
+            send_message(message.chat.id,
+                         "Выберите напоминание для удаления, нажав на него на клавиатуре.\n\n"
+                         "Чтобы окончить процесс удаления, нажмите кнопку '*Завершить*'.",
+                         reply_markup=markup, parse_mode='Markdown')
+        else:
+            done(message)
+
+
+@bot.message_handler(func=lambda message: message.text == 'Удалить все' and message.content_type == 'text')
+def clear(message):
+    state = db.get_state(message.chat)
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row('Да, точно', 'Нет, не надо')
+    if state == 'tasks' or state == 'clear_tasks':
+        db.set_state(message.chat, 'clear_tasks') if state == 'tasks' else None
+        send_message(message.chat.id,
+                     "*Вы точно хотите удалить все задачи?*",
+                     reply_markup=markup, parse_mode='Markdown')
+    elif state == 'reminders' or state == 'clear_rems':
+        db.set_state(message.chat, 'clear_rems') if state == 'reminders' else None
+        send_message(message.chat.id,
+                     "*Вы точно хотите удалить все напоминания?*",
+                     reply_markup=markup, parse_mode='Markdown')
+
+
+@bot.message_handler(regexp=r'^(\d?\d)\. .*')
+def del_task(message):
+    state = db.get_state(message.chat)
+    if state == 'del_task':
+        num = int(re.search(r'^(\d?\d)', message.text).group())
         try:
-            db.remove_task(message.from_user, int(text))
-            bot.send_message(message.chat.id, "Задача удалена.")
+            db.del_task(message.chat, num)
+            send_message(message.chat.id, "Задача удалена.")
         except ValueError:
-            bot.send_message(message.chat.id, "Порядковый номер задачи указан неверно.")
-    else:
-        bot.send_message(message.chat.id, "Формат:\n/removetask 3 - удалит задачу с порядковым номером 3.")
-        
-        
-@bot.message_handler(commands=['cleartasks'])
-def cleartasks(message):
-    text = message.text[11:].strip().lower()
-    if text == "yes":
+            send_message(message.chat.id, "Порядковый номер задачи указан неверно.")
+        delete(message)
+
+
+@bot.message_handler(regexp=r'^• ([0-2]?[0-9][.:-][0-5][0-9])')
+def del_rem(message):
+    state = db.get_state(message.chat)
+    if state == 'del_rem':
+        clock = re.findall(r'^• ([0-2]?[0-9][.:-][0-5][0-9])', message.text)[0]
+        hour, minute = map(int, re.split(r'[.:-]', clock))
+        if hour in range(0, 24) and minute in range(0, 60):
+            db.del_rem(message.chat, hour, minute)
+            send_message(message.chat.id, "Напоминание удалено.")
+        delete(message)
+
+
+@bot.message_handler(func=lambda message: message.text == 'Да, точно' and message.content_type == 'text')
+def yes(message):
+    state = db.get_state(message.chat)
+    if state == 'clear_tasks':
         db.clear_tasks(message.from_user)
-        bot.send_message(message.chat.id, "Ваши задачи удалены.")
-    else:
-        bot.send_message(message.chat.id, "Напишите слово 'yes' после команды /cleartasks, чтобы избежать случайного удаления задач.")
-    
-
-# сделать конечный автомат
-# сделать конечный автомат
-# сделать конечный автомат
-
-@bot.message_handler(commands=['cancel'])
-def cancel(message):
-    bot.send_message(message.chat.id, "Отмена предыдущего действия (пока бессмысленная вещь :) )")
+        send_message(message.chat.id, "Ваши задачи удалены.")
+        done(message)
+    elif state == 'clear_rems':
+        db.clear_rems(message.from_user)
+        send_message(message.chat.id, "Ваши напоминания удалены.")
+        done(message)
 
 
-def remind_thread():
-    db = SQLighter("idoit.db")
-    time = None
-    while True:
-        date = datetime.now()
-        now = str(date.hour).zfill(2) + ":" + str(date.minute).zfill(2)
-        if time != now:
-            users = db.get_users_reminders(now)
-            for id, tasks in users.items():
-                bot.send_message(id, tasks)
-            time = now
-    db.close()
-    
+@bot.message_handler(func=lambda message: message.text == 'Нет, не надо' and message.content_type == 'text')
+def no(message):
+    state = db.get_state(message.chat)
+    if state == 'clear_tasks' or state == 'clear_rems':
+        done(message)
 
-thread_remind = Thread(target=remind_thread)
-thread_remind.daemon = True
-thread_remind.start()
+
+@bot.message_handler(regexp=r'([0-2]?[0-9][.:-][0-5][0-9])')
+def add_rem(message):
+    state = db.get_state(message.chat)
+    if state == 'add_rem':
+        try:
+            rems = re.findall(r'([0-2]?[0-9][.:-][0-5][0-9])', message.text)
+            for rem in rems:
+                db.add_rem(message.chat, rem)
+            send_message(message.chat.id,
+                         "Напоминания добавлены.\n"
+                         "Вы можете добавить ещё напоминания, либо окончить процесс добавления, "
+                         "нажав кнопку '*Завершить*'.", parse_mode='Markdown')
+        except OverflowError:
+            db.set_state(message.chat, 'reminders')
+            send_message(message.chat.id, "Количество напоминалок единовременно не может превышать 30.\n")
+            reminders(message)
+    elif state == 'add_task':
+        add_task(message)
+
+
+@bot.message_handler(func=lambda message: message.content_type == 'text')
+def add_task(message):
+    state = db.get_state(message.chat)
+    if state == 'add_task':
+        added = 0
+        try:
+            for task in message.text.split("\n"):
+                db.add_task(message.chat, task)
+                added += 1
+            send_message(message.chat.id,
+                         "Все задачи добавлены.\n"
+                         "Вы можете добавить ещё задач, либо окончить процесс добавления, "
+                         "нажав кнопку '*Завершить*'.",
+                         parse_mode='Markdown')
+        except OverflowError:
+            db.set_state(message.chat, 'tasks')
+            send_message(message.chat.id,
+                         "Задач добавлено %d.\n"
+                         "Количество задач единовременно *не может превышать 20*.\n"
+                         "Для добавления новых задач, удалите старые." % added)
+            tasks(message)
+        except ValueError:
+            send_message(message.chat.id, "Задач добавлено %d.\n"
+                                          "Длина текста задачи должна быть в пределах *от 2х до 150ти символов*.\n"
+                                          "Попробуйте ещё раз." % added)
+    elif state == 'timezone':
+        set_tz(message)
+
+
+def send_message(chat_id, text, disable_web_page_preview=None, reply_to_message_id=None, reply_markup=None, 
+                 parse_mode=None, disable_notification=None):
+    try:
+        bot.send_message(chat_id, text, disable_web_page_preview, reply_to_message_id, reply_markup, parse_mode,
+                         disable_notification)
+        # with open('log.txt', 'a') as log:
+        #     log.write("[ id: %d, text: %s ]\n" % (chat_id, text.replace("\n", " | ")))
+    except ApiException as e:
+        print(e)
 
 
 if __name__ == "__main__":
+    db.check_db_exist()
     bot.polling(True)
